@@ -27,15 +27,12 @@ class APIController {
     //case 1:
     //private val paymentRateLimiter = LeakingBucketRateLimiter(10, java.time.Duration.ofSeconds(1), 10)
     // case 2:
-    /* private val paymentRateLimiter = CompositeRateLimiter(
-        rl1 = TokenBucketRateLimiter(11, 132, 1, TimeUnit.SECONDS),
-        rl2 = LeakingBucketRateLimiter(10, java.time.Duration.ofSeconds(1), 130)
-    )*/
+    private val paymentRateLimiter = LeakingBucketRateLimiter(10, java.time.Duration.ofSeconds(1), 130)
     // case 3:
-    private val paymentRateLimiter = CompositeRateLimiter(
+    /*private val paymentRateLimiter = CompositeRateLimiter(
         rl1 = TokenBucketRateLimiter(11, 286, 1, TimeUnit.SECONDS),
         rl2 = LeakingBucketRateLimiter(10, java.time.Duration.ofSeconds(1), 260)
-    )
+    )*/
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
