@@ -12,10 +12,13 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
+import ru.quipy.domain.Event
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.InterruptedIOException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
 
@@ -66,6 +69,36 @@ class PaymentExternalSystemAdapterImpl(
         .description("Expired payment requests count")
         .register(Metrics.globalRegistry)
 
+    private val eventStoreQueue =
+        LinkedBlockingQueue<(EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>) -> Unit>(500_000)
+
+    @Suppress("unused")
+    private val eventStoreExecutor = Executors.newFixedThreadPool(20).also { executor ->
+        repeat(20) {
+            executor.submit {
+                while (true) {
+                    val task = eventStoreQueue.take()
+                    try {
+                        task(paymentESService)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] EventStore update failed", e)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun queueEventStoreUpdate(
+        paymentId: UUID,
+        block: (PaymentAggregateState) -> Event<PaymentAggregate>
+    ) {
+        eventStoreQueue.put { es ->
+            es.update(paymentId) { state ->
+                block(state)
+            }
+        }
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         incomingRequestsCounter.increment()
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -78,7 +111,7 @@ class PaymentExternalSystemAdapterImpl(
 
             // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
             // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-            paymentESService.update(paymentId) {
+            queueEventStoreUpdate(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
 
@@ -91,7 +124,7 @@ class PaymentExternalSystemAdapterImpl(
             while (attempt < maxRetries) {
                 if (System.currentTimeMillis() > deadline) {
                     logger.warn("[$accountName] Payment $paymentId deadline exceeded")
-                    paymentESService.update(paymentId) {
+                    queueEventStoreUpdate(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
                     }
                     return
@@ -100,7 +133,7 @@ class PaymentExternalSystemAdapterImpl(
                 while (!rateLimiter.tick()) {
                     if (System.currentTimeMillis() > deadline) {
                         logger.warn("[$accountName] Payment $paymentId expired while waiting for rate limit")
-                        paymentESService.update(paymentId) {
+                        queueEventStoreUpdate(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limit")
                         }
                         expiredRequestsCounter.increment()
@@ -127,7 +160,7 @@ class PaymentExternalSystemAdapterImpl(
                         if (!body.result && attempt < maxRetries - 1) {
                             if (System.currentTimeMillis() + sleepTime > deadline) {
                                 logger.warn("[$accountName] Payment $paymentId no time for retry, deadline too close")
-                                paymentESService.update(paymentId) {
+                                queueEventStoreUpdate(paymentId) {
                                     it.logProcessing(false, now(), transactionId, reason = body.message)
                                 }
                                 return
@@ -141,7 +174,7 @@ class PaymentExternalSystemAdapterImpl(
 
                         // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                         // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                        paymentESService.update(paymentId) {
+                        queueEventStoreUpdate(paymentId) {
                             it.logProcessing(body.result, now(), transactionId, reason = body.message)
                         }
                         return
@@ -155,7 +188,7 @@ class PaymentExternalSystemAdapterImpl(
                 } catch (e: Exception) {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
 
-                    paymentESService.update(paymentId) {
+                    queueEventStoreUpdate(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
                     return
@@ -163,7 +196,7 @@ class PaymentExternalSystemAdapterImpl(
             }
             
             logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId after $maxRetries attempts")
-            paymentESService.update(paymentId) {
+            queueEventStoreUpdate(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Failed after retries")
             }
         } finally {
