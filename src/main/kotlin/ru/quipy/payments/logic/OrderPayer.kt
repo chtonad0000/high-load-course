@@ -12,7 +12,6 @@ import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-
 @Service
 class OrderPayer {
 
@@ -26,30 +25,30 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    // здесь было 32/64 — ДЕЛАЙ 256/256
     private val paymentExecutor = ThreadPoolExecutor(
-        2000,
-        20000,
-        60L,
-        TimeUnit.SECONDS,
-        LinkedBlockingQueue(200_000),
+        1000,          // core
+        1000,          // max
+        60L, TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(400_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
+
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+                it.create(paymentId, orderId, amount)
             }
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
+            // дальше всё async
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
+
         return createdAt
     }
 }

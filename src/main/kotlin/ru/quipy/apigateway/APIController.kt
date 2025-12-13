@@ -13,7 +13,6 @@ import ru.quipy.payments.logic.OrderPayer
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
-
 @RestController
 class APIController {
 
@@ -25,7 +24,8 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 1100)
+    // ⚠️ ЭТОГО БОЛЬШЕ НЕТ:
+    // private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 1100)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -33,7 +33,6 @@ class APIController {
     }
 
     data class CreateUserRequest(val name: String, val password: String)
-
     data class User(val id: UUID, val name: String)
 
     @PostMapping("/orders")
@@ -64,19 +63,12 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
-        if (!paymentRateLimiter.tick()) {
-            logger.warn("Rate limit exceeded for payment request, orderId: $orderId")
-            return ResponseEntity
-                .status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "2")
-                .body(mapOf("error" to "Rate limit exceeded"))
-        }
-
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+
+        val order = orderRepository.findById(orderId)
+            ?: throw IllegalArgumentException("No such order $orderId")
+
+        orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))

@@ -15,15 +15,21 @@ import kotlin.concurrent.withLock
 
 @Service
 class PaymentSystemImpl(
-    private val paymentAccounts: List<PaymentExternalSystemAdapter>
+    private val adapters: List<PaymentExternalSystemAdapter>
 ) : PaymentService {
     companion object {
-        val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
+        private val logger = LoggerFactory.getLogger(PaymentService::class.java)
     }
 
+    private val activeAdapters: List<PaymentExternalSystemAdapter> =
+        adapters.filter { it.isEnabled() }.sortedBy { it.price() }
+
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        for (account in paymentAccounts) {
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+        val adapter = activeAdapters.firstOrNull()
+        if (adapter == null) {
+            logger.error("No enabled payment accounts available")
+            return
         }
+        adapter.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
     }
 }
