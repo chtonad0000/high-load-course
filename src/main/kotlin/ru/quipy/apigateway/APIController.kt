@@ -24,7 +24,6 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    // ⚠️ ЭТОГО БОЛЬШЕ НЕТ:
     // private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 1100)
 
     @PostMapping("/users")

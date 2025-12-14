@@ -25,10 +25,9 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    // здесь было 32/64 — ДЕЛАЙ 256/256
     private val paymentExecutor = ThreadPoolExecutor(
-        1000,          // core
-        1000,          // max
+        1000,
+        1000,
         60L, TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(400_000),
         NamedThreadFactory("payment-submission-executor"),
@@ -45,7 +44,6 @@ class OrderPayer {
             }
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            // дальше всё async
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
 
