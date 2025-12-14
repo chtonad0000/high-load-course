@@ -21,7 +21,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
-// ВАЖНО: никаких внутренних очередей/циклов ожидания rateLimiter здесь больше нет.
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -36,26 +35,22 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime  // PT10S
-    private val rateLimitPerSec = properties.rateLimitPerSec                     // 1100
-    private val parallelRequests = properties.parallelRequests                   // 20000
+    private val requestAverageProcessingTime = properties.averageProcessingTime
+    private val rateLimitPerSec = properties.rateLimitPerSec
+    private val parallelRequests = properties.parallelRequests
 
-    // Async HTTP-клиент без блокировок
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .version(HttpClient.Version.HTTP_1_1)
         .connectTimeout(Duration.ofSeconds(2))
         .build()
 
-    // rps-лимит: используем только одноразовый tick(), без ожиданий
     private val rateLimiter = SlidingWindowRateLimiter(
         rate = rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1)
     )
 
-    // ограничение числа одновременных запросов к внешней системе
     private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
 
-    // отдельный пул для обновлений EventStore, как в исходнике
     private val eventStoreQueue =
         LinkedBlockingQueue<(EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>) -> Unit>(500_000)
 
@@ -108,7 +103,6 @@ class PaymentExternalSystemAdapterImpl(
         val now = now()
 
         fun failFast(reason: String) {
-            // логируем "submission" как неуспешный — тесту видно, что мы заявку видели, но не отправили во внешнюю систему
             queueEventStoreUpdate(paymentId) {
                 it.logSubmission(
                     false,
@@ -123,14 +117,12 @@ class PaymentExternalSystemAdapterImpl(
             expiredRequestsCounter.increment()
         }
 
-        // если уже заведомо не уложимся в дедлайн — сразу отказ
         if (now + requestAverageProcessingTime.toMillis() > deadline) {
             logger.warn("[$accountName] Payment $paymentId deadline too close, reject immediately")
             failFast("Deadline too close for processing")
             return
         }
 
-        // ограничиваем параллелизм НЕ блокируя поток
         val winRes = ongoingWindow.putIntoWindow()
         if (winRes is NonBlockingOngoingWindow.WindowResponse.Fail) {
             logger.warn("[$accountName] Too many parallel requests, reject payment $paymentId")
@@ -138,7 +130,6 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // одноразовый rate-лимит: либо пропускаем, либо сразу отказываем, без ожиданий и очередей
         if (!rateLimiter.tick()) {
             logger.warn("[$accountName] Rate limit exceeded, reject payment $paymentId")
             ongoingWindow.releaseWindow()
@@ -146,7 +137,6 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // с этого момента считаем, что запрос реально "отправляем" во внешнюю систему
         queueEventStoreUpdate(paymentId) {
             it.logSubmission(
                 true,
@@ -161,7 +151,7 @@ class PaymentExternalSystemAdapterImpl(
         val remaining = deadline - now()
         val timeoutMillis = remaining
             .coerceAtLeast(requestAverageProcessingTime.plusSeconds(5).toMillis())
-            .coerceAtMost(60_000L) // не даём висеть бесконечно
+            .coerceAtMost(60_000L)
 
         val host = paymentProviderHostPort.substringBefore(':')
         val port = paymentProviderHostPort.substringAfter(':').toInt()
