@@ -59,9 +59,9 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
-            val response = semaphore.withPermit {
-                rateLimiter.tickBlocking()
+            rateLimiter.tickBlocking()
 
+            val response = semaphore.withPermit {
                 webClient
                     .post()
                     .uri(
