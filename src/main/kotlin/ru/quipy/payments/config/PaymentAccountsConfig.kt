@@ -6,7 +6,11 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.web.reactive.function.client.WebClient
+import reactor.netty.http.HttpProtocol
+import reactor.netty.http.client.HttpClient
+import reactor.netty.resources.ConnectionProvider
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.PaymentAccountProperties
@@ -14,7 +18,6 @@ import ru.quipy.payments.logic.PaymentAggregateState
 import ru.quipy.payments.logic.PaymentExternalSystemAdapter
 import ru.quipy.payments.logic.PaymentExternalSystemAdapterImpl
 import java.net.URI
-import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.UUID
@@ -22,7 +25,7 @@ import java.util.UUID
 @Configuration
 class PaymentAccountsConfig {
     companion object {
-        private val javaClient = HttpClient.newBuilder().build()
+        private val javaClient = java.net.http.HttpClient.newBuilder().build()
         private val mapper = ObjectMapper().registerKotlinModule().registerModules(JavaTimeModule())
     }
 
@@ -37,6 +40,23 @@ class PaymentAccountsConfig {
 
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
+
+    @Bean
+    fun webClient(): WebClient {
+        val connectionProvider = ConnectionProvider
+            .builder("connection_provider")
+            .maxConnections(10_000)
+            .build()
+
+        val httpClient = HttpClient
+            .create(connectionProvider)
+            .protocol(HttpProtocol.H2C)
+
+        return WebClient
+            .builder()
+            .clientConnector(ReactorClientHttpConnector(httpClient))
+            .build()
+    }
 
     @Bean
     fun accountAdapters(
