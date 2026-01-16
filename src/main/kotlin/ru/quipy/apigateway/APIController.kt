@@ -23,7 +23,7 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val paymentRateLimiter = SlidingWindowRateLimiter(1050)
+    private val paymentRateLimiter = SlidingWindowRateLimiter(1150)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
