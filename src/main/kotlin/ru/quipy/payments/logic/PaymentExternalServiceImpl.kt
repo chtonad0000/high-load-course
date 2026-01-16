@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.launch
@@ -37,8 +40,23 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec*0.97).toLong())
+    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec * 0.97).toLong())
     private val semaphore = Semaphore(parallelRequests)
+
+    private val incomingRequestsCounter = Counter.builder("payment_requests_incoming")
+        .tag("accountName", accountName)
+        .description("Incoming payment requests count")
+        .register(Metrics.globalRegistry)
+
+    private val completedRequestsCounter = Counter.builder("payment_requests_completed")
+        .tag("accountName", accountName)
+        .description("Completed payment requests count")
+        .register(Metrics.globalRegistry)
+
+    private val expiredRequestsCounter = Counter.builder("payment_requests_expired")
+        .tag("accountName", accountName)
+        .description("Expired payment requests count")
+        .register(Metrics.globalRegistry)
 
     @OptIn(DelicateCoroutinesApi::class)
     private val dbScope = CoroutineScope(
@@ -46,9 +64,11 @@ class PaymentExternalSystemAdapterImpl(
     )
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        incomingRequestsCounter.increment()
         logger.info("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
+        val sample = Timer.start()
 
         dbScope.launch {
             paymentESService.update(paymentId) {
@@ -59,9 +79,31 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
-            rateLimiter.tickBlocking()
-            
+            if (now() > deadline) {
+                logger.warn("[$accountName] Payment $paymentId deadline exceeded before processing")
+                expiredRequestsCounter.increment()
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
+                    }
+                }
+                return
+            }
+
             val response = semaphore.withPermit {
+                rateLimiter.tickBlocking()
+
+                if (now() > deadline) {
+                    logger.warn("[$accountName] Payment $paymentId expired while waiting for rate limit")
+                    expiredRequestsCounter.increment()
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limit")
+                        }
+                    }
+                    return
+                }
+
                 webClient
                     .post()
                     .uri(
@@ -88,6 +130,7 @@ class PaymentExternalSystemAdapterImpl(
                     )
                 }
             }
+            completedRequestsCounter.increment()
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
@@ -108,6 +151,12 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            sample.stop(Metrics.timer(
+                "payment_duration_seconds",
+                "service", serviceName,
+                "account", accountName
+            ))
         }
     }
 
