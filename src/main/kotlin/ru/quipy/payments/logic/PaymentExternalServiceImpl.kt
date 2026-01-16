@@ -79,30 +79,8 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
-            if (now() > deadline) {
-                logger.warn("[$accountName] Payment $paymentId deadline exceeded before processing")
-                expiredRequestsCounter.increment()
-                dbScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
-                    }
-                }
-                return
-            }
-
             val response = semaphore.withPermit {
                 rateLimiter.tickBlocking()
-
-                if (now() > deadline) {
-                    logger.warn("[$accountName] Payment $paymentId expired while waiting for rate limit")
-                    expiredRequestsCounter.increment()
-                    dbScope.launch {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded while waiting for rate limit")
-                        }
-                    }
-                    return
-                }
 
                 webClient
                     .post()
