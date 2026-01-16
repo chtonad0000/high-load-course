@@ -6,18 +6,17 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import java.time.Duration
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 
 class LeakingBucketRateLimiter(
-    private val ratePerSecond: Long,
+    private val rate: Long,
+    private val window: Duration,
     bucketSize: Int,
 ) : RateLimiter {
     private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
     private val queue = LinkedBlockingQueue<Int>(bucketSize)
-    
-    private val intervalMs = 10L
-    private val releasePerInterval = (ratePerSecond * intervalMs / 1000).coerceAtLeast(1)
 
     override fun tick(): Boolean {
         return queue.offer(1)
@@ -25,8 +24,8 @@ class LeakingBucketRateLimiter(
 
     private val releaseJob = rateLimiterScope.launch {
         while (true) {
-            delay(intervalMs)
-            repeat(releasePerInterval.toInt()) {
+            delay(window.toMillis())
+            for (i in 0..rate) {
                 queue.poll()
             }
         }
