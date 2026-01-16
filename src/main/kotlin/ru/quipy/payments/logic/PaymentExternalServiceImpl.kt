@@ -37,7 +37,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec*0.96).toLong())
+    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec*0.94).toLong())
     private val semaphore = Semaphore(parallelRequests)
 
     @OptIn(DelicateCoroutinesApi::class)
