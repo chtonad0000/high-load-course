@@ -7,12 +7,10 @@ import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.common.utils.LeakingBucketRateLimiter
-import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.TimeUnit
 
 @RestController
 class APIController {
@@ -25,7 +23,7 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val paymentRateLimiter = LeakingBucketRateLimiter(100, Duration.ofSeconds(1), 270)
+    private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 1100)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -33,7 +31,6 @@ class APIController {
     }
 
     data class CreateUserRequest(val name: String, val password: String)
-
     data class User(val id: UUID, val name: String)
 
     @PostMapping("/orders")
@@ -63,12 +60,12 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
+    suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
         if (!paymentRateLimiter.tick()) {
             logger.warn("Rate limit exceeded for payment request, orderId: $orderId")
             return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "2")
+                .header("Retry-After", "1")
                 .body(mapOf("error" to "Rate limit exceeded"))
         }
 
