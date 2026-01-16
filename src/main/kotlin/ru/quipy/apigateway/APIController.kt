@@ -6,10 +6,9 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
-import java.time.Duration
 import java.util.*
 
 @RestController
@@ -23,7 +22,7 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val paymentRateLimiter = SlidingWindowRateLimiter(1150)
+    private val paymentRateLimiter = LeakingBucketRateLimiter(1100, 1100)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
