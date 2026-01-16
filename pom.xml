@@ -40,7 +40,6 @@
     </dependencyManagement>
 
     <dependencies>
-        <!-- Spring -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
@@ -64,7 +63,6 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- Kotlin -->
         <dependency>
             <groupId>org.jetbrains.kotlin</groupId>
             <artifactId>kotlin-stdlib-jdk8</artifactId>
@@ -73,15 +71,12 @@
             <groupId>org.jetbrains.kotlin</groupId>
             <artifactId>kotlin-reflect</artifactId>
         </dependency>
-        <!-- Jetty HTTP/2 (h2c) -->
         <dependency>
             <groupId>org.eclipse.jetty.http2</groupId>
             <artifactId>jetty-http2-server</artifactId>
-            <!-- версию брать из BOM Spring Boot -->
         </dependency>
 
 
-        <!-- Coroutines -->
         <dependency>
             <groupId>org.jetbrains.kotlinx</groupId>
             <artifactId>kotlinx-coroutines-core</artifactId>
@@ -93,8 +88,6 @@
             <version>${coroutines.version}</version>
         </dependency>
 
-        <!-- Ktor HTTP-client -->
-        <!-- Ktor HTTP client (JVM) -->
         <dependency>
             <groupId>io.ktor</groupId>
             <artifactId>ktor-client-core-jvm</artifactId>
@@ -105,14 +98,12 @@
         </dependency>
 
 
-        <!-- OkHttp (оставлен для старого кода) -->
         <dependency>
             <groupId>com.squareup.okhttp3</groupId>
             <artifactId>okhttp</artifactId>
             <version>${okhttp.version}</version>
         </dependency>
 
-        <!-- Event-sourcing libs -->
         <dependency>
             <groupId>ru.quipy</groupId>
             <artifactId>tiny-event-sourcing-spring-boot-starter</artifactId>
@@ -124,7 +115,6 @@
             <version>${tiny.es.version}</version>
         </dependency>
 
-        <!-- Misc -->
         <dependency>
             <groupId>com.fasterxml.jackson.module</groupId>
             <artifactId>jackson-module-kotlin</artifactId>
@@ -144,7 +134,6 @@
             <version>${resilience4j.version}</version>
         </dependency>
 
-        <!-- Tests -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
@@ -162,13 +151,11 @@
         <testSourceDirectory>${project.basedir}/src/test/kotlin</testSourceDirectory>
 
         <plugins>
-            <!-- Spring Boot -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
 
-            <!-- Kotlin compiler -->
             <plugin>
                 <groupId>org.jetbrains.kotlin</groupId>
                 <artifactId>kotlin-maven-plugin</artifactId>
