@@ -22,6 +22,8 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
 
+
+// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -51,11 +53,6 @@ class PaymentExternalSystemAdapterImpl(
     private val completedRequestsCounter = Counter.builder("payment_requests_completed")
         .tag("accountName", accountName)
         .description("Completed payment requests count")
-        .register(Metrics.globalRegistry)
-
-    private val expiredRequestsCounter = Counter.builder("payment_requests_expired")
-        .tag("accountName", accountName)
-        .description("Expired payment requests count")
         .register(Metrics.globalRegistry)
 
     @OptIn(DelicateCoroutinesApi::class)
@@ -101,6 +98,8 @@ class PaymentExternalSystemAdapterImpl(
 
             logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, message: ${response.body?.result}, result code: ${response.statusCode}")
 
+            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logProcessing(
