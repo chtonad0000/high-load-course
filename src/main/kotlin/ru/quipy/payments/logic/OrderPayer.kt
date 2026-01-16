@@ -19,7 +19,7 @@ class OrderPayer(registry: MeterRegistry) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val THREAD_COUNT = 200
+        private const val THREAD_COUNT = 300
     }
 
     @Autowired
@@ -33,13 +33,10 @@ class OrderPayer(registry: MeterRegistry) {
         newFixedThreadPoolContext(THREAD_COUNT, "io_pool")
     )
 
-    private val paymentExecutionTimer = registry.timer("payment_executor_task_duration")
-
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
 
         executorScope.launch {
-            val start = System.nanoTime()
             val createdEvent = paymentESService.create {
                 it.create(
                     paymentId,
@@ -47,10 +44,9 @@ class OrderPayer(registry: MeterRegistry) {
                     amount
                 )
             }
-            logger.info("Payment ${createdEvent.paymentId} for order $orderId created.")
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-            paymentExecutionTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS)
         }
 
         return createdAt
