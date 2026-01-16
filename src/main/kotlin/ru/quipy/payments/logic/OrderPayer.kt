@@ -15,7 +15,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 @Service
-class OrderPayer(registry: MeterRegistry) {
+class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
