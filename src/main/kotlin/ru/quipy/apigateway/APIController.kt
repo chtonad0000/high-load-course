@@ -23,7 +23,7 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 950)
+    private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 800)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
