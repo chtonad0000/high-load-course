@@ -11,10 +11,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
 import kotlinx.coroutines.reactor.awaitSingle
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import org.slf4j.LoggerFactory
 import org.springframework.http.MediaType
 import org.springframework.web.reactive.function.client.WebClient
+import reactor.core.publisher.Mono
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -35,6 +35,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper: ObjectMapper = ObjectMapper().registerKotlinModule()
+        private const val DEADLINE_BUFFER_MS = 150L
     }
 
     private val serviceName = properties.serviceName
@@ -75,31 +76,73 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        try {
-            val response = semaphore.withPermit {
-                rateLimiter.tickBlocking()
-
-                webClient
-                    .post()
-                    .uri(
-                        "http://$paymentProviderHostPort/external/process" +
-                                "?serviceName=$serviceName" +
-                                "&token=$token" +
-                                "&accountName=$accountName" +
-                                "&transactionId=$transactionId" +
-                                "&paymentId=$paymentId" +
-                                "&amount=$amount"
-                    )
-                    .accept(MediaType.APPLICATION_JSON)
-                    .retrieve()
-                    .toEntity(ExternalSysResponse::class.java)
-                    .awaitSingle()
+        val remainingBeforeRequest = deadline - now() - DEADLINE_BUFFER_MS
+        if (remainingBeforeRequest <= 0) {
+            logger.warn("[$accountName] Deadline too close, rejecting payment $paymentId, remaining: ${deadline - now()}ms")
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline too close on entry.")
+                }
             }
+            return
+        }
+
+        if (!semaphore.tryAcquire()) {
+            logger.warn("[$accountName] Semaphore full, rejecting payment $paymentId")
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Too many parallel requests.")
+                }
+            }
+            return
+        }
+
+        try {
+            val rateLimitTimeout = deadline - now() - DEADLINE_BUFFER_MS
+            if (rateLimitTimeout <= 0 || !rateLimiter.tickSuspend(rateLimitTimeout)) {
+                logger.warn("[$accountName] Rate limiter timeout/deadline, rejecting payment $paymentId")
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Rate limiter timeout.")
+                    }
+                }
+                return
+            }
+
+            val timeoutMillis = deadline - now() - DEADLINE_BUFFER_MS
+            if (timeoutMillis <= 0) {
+                logger.warn("[$accountName] No time left after rate limiting for payment $paymentId")
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "No time left after rate limiting.")
+                    }
+                }
+                return
+            }
+
+            val response = webClient
+                .post()
+                .uri(
+                    "http://$paymentProviderHostPort/external/process" +
+                            "?serviceName=$serviceName" +
+                            "&token=$token" +
+                            "&accountName=$accountName" +
+                            "&transactionId=$transactionId" +
+                            "&paymentId=$paymentId" +
+                            "&amount=$amount"
+                )
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .toEntity(ExternalSysResponse::class.java)
+                .timeout(Duration.ofMillis(timeoutMillis))
+                .onErrorResume { ex ->
+                    logger.error("[$accountName] WebClient error for txId: $transactionId, payment: $paymentId", ex)
+                    Mono.empty()
+                }
+                .awaitSingle()
 
             logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, message: ${response.body?.result}, result code: ${response.statusCode}")
 
-            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logProcessing(
@@ -129,11 +172,29 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
+            semaphore.release()
             sample.stop(Metrics.timer(
                 "payment_duration_seconds",
                 "service", serviceName,
                 "account", accountName
             ))
+        }
+    }
+
+    fun preWarmConnection() {
+        try {
+            logger.info("[$accountName] Pre-warming connection to $paymentProviderHostPort")
+            for (i in 1..3) {
+                webClient
+                    .get()
+                    .uri("http://$paymentProviderHostPort/external/accounts?serviceName=$serviceName&token=$token")
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block(Duration.ofSeconds(5))
+            }
+            logger.info("[$accountName] Connection pre-warmed successfully")
+        } catch (e: Exception) {
+            logger.warn("[$accountName] Connection pre-warm failed: ${e.message}")
         }
     }
 

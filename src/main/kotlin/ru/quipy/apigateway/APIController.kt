@@ -23,7 +23,7 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 1100)
+    private val paymentRateLimiter = LeakingBucketRateLimiter(4500, Duration.ofSeconds(1), 4500)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -34,7 +34,7 @@ class APIController {
     data class User(val id: UUID, val name: String)
 
     @PostMapping("/orders")
-    fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
+    suspend fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
         val order = Order(
             UUID.randomUUID(),
             userId,
@@ -61,6 +61,15 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
+        val now = System.currentTimeMillis()
+        if (now + 500 > deadline) {
+            logger.warn("Deadline too close for payment request, orderId: $orderId, remaining: ${deadline - now}ms")
+            return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", "1")
+                .body(mapOf("error" to "Deadline too close"))
+        }
+
         if (!paymentRateLimiter.tick()) {
             logger.warn("Rate limit exceeded for payment request, orderId: $orderId")
             return ResponseEntity
