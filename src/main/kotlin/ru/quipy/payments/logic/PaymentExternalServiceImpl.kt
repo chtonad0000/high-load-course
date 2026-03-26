@@ -61,7 +61,7 @@ class PaymentExternalSystemAdapterImpl(
 
     @OptIn(DelicateCoroutinesApi::class)
     private val paymentScope = CoroutineScope(
-        newFixedThreadPoolContext(350, "payment_pool") + SupervisorJob()
+        newFixedThreadPoolContext(250, "payment_pool") + SupervisorJob()
     )
 
     @OptIn(DelicateCoroutinesApi::class)
