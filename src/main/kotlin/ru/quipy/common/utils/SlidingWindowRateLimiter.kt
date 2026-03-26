@@ -4,12 +4,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.time.delay
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Duration
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
-import java.util.concurrent.PriorityBlockingQueue
 import java.util.concurrent.atomic.AtomicLong
 
 class SlidingWindowRateLimiter(
@@ -19,14 +18,14 @@ class SlidingWindowRateLimiter(
     private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
     private val sum = AtomicLong(0)
-    private val queue = PriorityBlockingQueue<Measure>(1000)
+    private val queue = ConcurrentLinkedQueue<Long>()
 
     override fun tick(): Boolean {
         while (true) {
             val curSum = sum.get()
             if (curSum >= rate) return false
             if (sum.compareAndSet(curSum, curSum + 1)) {
-                queue.add(Measure(1, System.nanoTime()))
+                queue.add(System.nanoTime())
                 return true
             }
         }
@@ -42,34 +41,32 @@ class SlidingWindowRateLimiter(
         val start = System.currentTimeMillis()
         while (!tick()) {
             if (System.currentTimeMillis() - start >= timeoutMillis) return false
-            delay(5L)
+            delay(1L)
         }
         return true
     }
 
-    data class Measure(
-        val value: Long,
-        val timestamp: Long
-    ) : Comparable<Measure> {
-        override fun compareTo(other: Measure): Int {
-            return timestamp.compareTo(other.timestamp)
-        }
-    }
-
     private val releaseJob = rateLimiterScope.launch {
+        val windowNanos = window.toNanos()
         while (true) {
             val head = queue.peek()
-            val winStart = System.nanoTime() - window.toNanos()
             if (head == null) {
                 delay(1L)
                 continue
             }
-            if (head.timestamp > winStart) {
-                delay(Duration.ofNanos(head.timestamp - winStart))
-                continue
+            val now = System.nanoTime()
+            val elapsed = now - head
+            if (elapsed >= windowNanos) {
+                queue.poll()
+                sum.decrementAndGet()
+            } else {
+                val remainingMs = (windowNanos - elapsed) / 1_000_000
+                if (remainingMs > 1) {
+                    delay(remainingMs)
+                } else {
+                    delay(1L)
+                }
             }
-            sum.addAndGet(-1)
-            queue.take()
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
     companion object {
