@@ -87,7 +87,7 @@ class PaymentAccountsConfig {
                     paymentProviderHostPort,
                     token,
                     webClient
-                ) // .also { adapter -> adapter.preWarmConnection() }
+                ).also { adapter -> adapter.preWarmConnection() }
             }
     }
 }
