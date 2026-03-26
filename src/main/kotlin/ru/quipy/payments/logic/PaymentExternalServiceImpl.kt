@@ -46,7 +46,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
+    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec*1.1).toLong())
     private val semaphore = Semaphore(parallelRequests)
 
     private val incomingRequestsCounter = Counter.builder("payment_requests_incoming")
@@ -81,12 +81,11 @@ class PaymentExternalSystemAdapterImpl(
         val sample = Timer.start()
 
         dbScope.launch {
-            paymentESService.create {
-                it.create(paymentId, orderId, amount)
-            }
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-            }
+            try {
+                paymentESService.create {
+                    it.create(paymentId, orderId, amount)
+                }
+            } catch (_: Exception) { }
         }
 
         val remainingBeforeRequest = deadline - now() - DEADLINE_BUFFER_MS
