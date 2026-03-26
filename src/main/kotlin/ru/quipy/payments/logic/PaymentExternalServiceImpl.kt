@@ -10,9 +10,9 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
-import kotlinx.coroutines.reactor.awaitSingleOrNull
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import org.springframework.http.MediaType
@@ -151,7 +151,6 @@ class PaymentExternalSystemAdapterImpl(
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build()
 
-            val startTime = now()
             val futures = mutableListOf<CompletableFuture<HttpResponse<String>>>()
             futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
 
@@ -162,53 +161,27 @@ class PaymentExternalSystemAdapterImpl(
                 }, hedgeDelayMs * i, TimeUnit.MILLISECONDS)
             }
 
-            CompletableFuture.anyOf(*futures.toTypedArray())
-                .thenApply { winner ->
-                    @Suppress("UNCHECKED_CAST")
-                    winner as? HttpResponse<String> ?: throw RuntimeException("No response received")
-                }
-                .thenApply { response ->
-                    val body = try {
-                        mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
+            @Suppress("UNCHECKED_CAST")
+            val response = CompletableFuture.anyOf(*futures.toTypedArray()).await() as HttpResponse<String>
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+            val body = try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
 
-                    dbScope.launch {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                        }
-                    }
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                    if (body.result) {
-                        completedRequestsCounter.increment()
-                    }
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
-                .exceptionally { ex ->
-                    when (ex) {
-                        is SocketTimeoutException -> {
-                            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
-                            dbScope.launch {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                                }
-                            }
-                        }
-                        else -> {
-                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
-                            dbScope.launch {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = ex.message)
-                                }
-                            }
-                        }
-                    }
-                    null
-                }
-                .get(timeoutMillis, TimeUnit.MILLISECONDS)
+            }
+
+            if (body.result) {
+                completedRequestsCounter.increment()
+            }
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
