@@ -38,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper: ObjectMapper = ObjectMapper().registerKotlinModule()
-        private const val DEADLINE_BUFFER_MS = 250L
+        private const val DEADLINE_BUFFER_MS = 150L
     }
 
     private val serviceName = properties.serviceName

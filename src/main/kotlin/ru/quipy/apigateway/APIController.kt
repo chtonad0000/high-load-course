@@ -65,7 +65,7 @@ class APIController {
         if (now + 800 > deadline) {
             return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "2")
+                .header("Retry-After", "1")
                 .body(mapOf("error" to "Deadline too close"))
         }
 
