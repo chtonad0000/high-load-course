@@ -21,9 +21,15 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -45,9 +51,18 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val retryAmount = 2
+    private val hedgeDelayMs = 160L
+    private val requestTimeoutMs = 1500L
 
-    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec * 0.95).toLong())
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
     private val semaphore = Semaphore(parallelRequests)
+    private val scheduler = Executors.newScheduledThreadPool(100)
+
+    private val http2Client = HttpClient.newBuilder()
+        .executor(Executors.newFixedThreadPool(128))
+        .version(HttpClient.Version.HTTP_2)
+        .build()
 
     private val incomingRequestsCounter = Counter.builder("payment_requests_incoming")
         .tag("accountName", accountName)
@@ -61,7 +76,7 @@ class PaymentExternalSystemAdapterImpl(
 
     @OptIn(DelicateCoroutinesApi::class)
     private val paymentScope = CoroutineScope(
-        newFixedThreadPoolContext(270, "payment_pool") + SupervisorJob()
+        newFixedThreadPoolContext(250, "payment_pool") + SupervisorJob()
     )
 
     @OptIn(DelicateCoroutinesApi::class)
@@ -128,39 +143,72 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            val response = webClient
-                .post()
-                .uri(
-                    "http://$paymentProviderHostPort/external/process" +
-                            "?serviceName=$serviceName" +
-                            "&token=$token" +
-                            "&accountName=$accountName" +
-                            "&transactionId=$transactionId" +
-                            "&paymentId=$paymentId" +
-                            "&amount=$amount"
-                )
-                .accept(MediaType.APPLICATION_JSON)
-                .retrieve()
-                .toEntity(ExternalSysResponse::class.java)
-                .timeout(Duration.ofMillis(timeoutMillis))
-                .awaitSingleOrNull()
+            val idempotencyKey = transactionId.toString()
+            fun createRequest(): HttpRequest = HttpRequest.newBuilder()
+                .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+                .header("x-idempotency-key", idempotencyKey)
+                .timeout(Duration.ofMillis(requestTimeoutMs))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build()
 
-            if (response != null) {
-                dbScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(
-                            response.body!!.result, now(), transactionId, reason = response.body!!.message
-                        )
-                    }
-                }
-                completedRequestsCounter.increment()
-            } else {
-                dbScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Empty response (timeout or error).")
-                    }
-                }
+            val startTime = now()
+            val futures = mutableListOf<CompletableFuture<HttpResponse<String>>>()
+            futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
+
+            for (i in 1..retryAmount) {
+                scheduler.schedule({
+                    if (futures.any { it.isDone }) return@schedule
+                    futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
+                }, hedgeDelayMs * i, TimeUnit.MILLISECONDS)
             }
+
+            CompletableFuture.anyOf(*futures.toTypedArray())
+                .thenApply { winner ->
+                    @Suppress("UNCHECKED_CAST")
+                    winner as? HttpResponse<String> ?: throw RuntimeException("No response received")
+                }
+                .thenApply { response ->
+                    val body = try {
+                        mapper.readValue(response.body(), ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                    }
+
+                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
+                    }
+
+                    if (body.result) {
+                        completedRequestsCounter.increment()
+                    }
+                }
+                .exceptionally { ex ->
+                    when (ex) {
+                        is SocketTimeoutException -> {
+                            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", ex)
+                            dbScope.launch {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                                }
+                            }
+                        }
+                        else -> {
+                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", ex)
+                            dbScope.launch {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = ex.message)
+                                }
+                            }
+                        }
+                    }
+                    null
+                }
+                .get(timeoutMillis, TimeUnit.MILLISECONDS)
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
