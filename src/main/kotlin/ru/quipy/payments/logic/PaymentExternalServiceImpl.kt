@@ -46,7 +46,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
+    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec * 1.05).toLong())
     private val semaphore = Semaphore(parallelRequests)
 
     private val incomingRequestsCounter = Counter.builder("payment_requests_incoming")
@@ -72,13 +72,17 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(orderId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Job {
         incomingRequestsCounter.increment()
         return paymentScope.launch {
-            executePayment(paymentId, amount, paymentStartedAt, deadline)
+            executePayment(orderId, paymentId, amount, paymentStartedAt, deadline)
         }
     }
 
-    private suspend fun executePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    private suspend fun executePayment(orderId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
         val sample = Timer.start()
+
+        paymentESService.create {
+            it.create(paymentId, orderId, amount)
+        }
 
         dbScope.launch {
             paymentESService.update(paymentId) {
