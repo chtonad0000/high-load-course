@@ -9,12 +9,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
-import kotlinx.coroutines.reactor.awaitSingle
+import kotlinx.coroutines.reactor.awaitSingleOrNull
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import org.springframework.http.MediaType
 import org.springframework.web.reactive.function.client.WebClient
-import reactor.core.publisher.Mono
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -63,7 +62,6 @@ class PaymentExternalSystemAdapterImpl(
 
     override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         incomingRequestsCounter.increment()
-        logger.info("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
         val sample = Timer.start()
@@ -74,11 +72,8 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
         val remainingBeforeRequest = deadline - now() - DEADLINE_BUFFER_MS
         if (remainingBeforeRequest <= 0) {
-            logger.warn("[$accountName] Deadline too close, rejecting payment $paymentId, remaining: ${deadline - now()}ms")
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Deadline too close on entry.")
@@ -88,7 +83,6 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         if (!semaphore.tryAcquire()) {
-            logger.warn("[$accountName] Semaphore full, rejecting payment $paymentId")
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Too many parallel requests.")
@@ -100,7 +94,6 @@ class PaymentExternalSystemAdapterImpl(
         try {
             val rateLimitTimeout = deadline - now() - DEADLINE_BUFFER_MS
             if (rateLimitTimeout <= 0 || !rateLimiter.tickSuspend(rateLimitTimeout)) {
-                logger.warn("[$accountName] Rate limiter timeout/deadline, rejecting payment $paymentId")
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Rate limiter timeout.")
@@ -111,7 +104,6 @@ class PaymentExternalSystemAdapterImpl(
 
             val timeoutMillis = deadline - now() - DEADLINE_BUFFER_MS
             if (timeoutMillis <= 0) {
-                logger.warn("[$accountName] No time left after rate limiting for payment $paymentId")
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "No time left after rate limiting.")
@@ -135,22 +127,24 @@ class PaymentExternalSystemAdapterImpl(
                 .retrieve()
                 .toEntity(ExternalSysResponse::class.java)
                 .timeout(Duration.ofMillis(timeoutMillis))
-                .onErrorResume { ex ->
-                    logger.error("[$accountName] WebClient error for txId: $transactionId, payment: $paymentId", ex)
-                    Mono.empty()
+                .awaitSingleOrNull()
+
+            if (response != null) {
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(
+                            response.body!!.result, now(), transactionId, reason = response.body!!.message
+                        )
+                    }
                 }
-                .awaitSingle()
-
-            logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, message: ${response.body?.result}, result code: ${response.statusCode}")
-
-            dbScope.launch {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(
-                        response.body!!.result, now(), transactionId, reason = response.body!!.message
-                    )
+                completedRequestsCounter.increment()
+            } else {
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Empty response (timeout or error).")
+                    }
                 }
             }
-            completedRequestsCounter.increment()
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {

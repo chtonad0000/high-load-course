@@ -63,7 +63,6 @@ class APIController {
     suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
         val now = System.currentTimeMillis()
         if (now + 500 > deadline) {
-            logger.warn("Deadline too close for payment request, orderId: $orderId, remaining: ${deadline - now}ms")
             return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", "1")
@@ -71,7 +70,6 @@ class APIController {
         }
 
         if (!paymentRateLimiter.tick()) {
-            logger.warn("Rate limit exceeded for payment request, orderId: $orderId")
             return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", "1")
@@ -79,10 +77,8 @@ class APIController {
         }
 
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+        val order = orderRepository.findById(orderId)
+            ?: throw IllegalArgumentException("No such order $orderId")
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
