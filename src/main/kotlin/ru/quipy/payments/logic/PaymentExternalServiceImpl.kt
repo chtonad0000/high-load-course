@@ -46,7 +46,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec * 0.95).toLong())
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
     private val semaphore = Semaphore(parallelRequests)
 
     private val incomingRequestsCounter = Counter.builder("payment_requests_incoming")
