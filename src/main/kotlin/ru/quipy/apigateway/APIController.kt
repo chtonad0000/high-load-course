@@ -62,10 +62,10 @@ class APIController {
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
         val now = System.currentTimeMillis()
-        if (now + 700 > deadline) {
+        if (now + 800 > deadline) {
             return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "1")
+                .header("Retry-After", "2")
                 .body(mapOf("error" to "Deadline too close"))
         }
 
