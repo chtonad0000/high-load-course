@@ -38,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper: ObjectMapper = ObjectMapper().registerKotlinModule()
-        private const val DEADLINE_BUFFER_MS = 150L
+        private const val DEADLINE_BUFFER_MS = 170L
     }
 
     private val serviceName = properties.serviceName
@@ -61,7 +61,7 @@ class PaymentExternalSystemAdapterImpl(
 
     @OptIn(DelicateCoroutinesApi::class)
     private val paymentScope = CoroutineScope(
-        newFixedThreadPoolContext(250, "payment_pool") + SupervisorJob()
+        newFixedThreadPoolContext(270, "payment_pool") + SupervisorJob()
     )
 
     @OptIn(DelicateCoroutinesApi::class)
