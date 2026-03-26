@@ -1,54 +1,25 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.MeterRegistry
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.newFixedThreadPoolContext
+import kotlinx.coroutines.Job
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.core.EventSourcingService
-import ru.quipy.payments.api.PaymentAggregate
 import java.util.UUID
-import java.util.concurrent.TimeUnit
 
 @Service
 class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val THREAD_COUNT = 500
     }
-
-    @Autowired
-    private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    @OptIn(DelicateCoroutinesApi::class)
-    private val executorScope = CoroutineScope(
-        newFixedThreadPoolContext(THREAD_COUNT, "io_pool")
-    )
-
-    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Pair<Long, List<Job>> {
         val createdAt = System.currentTimeMillis()
-
-        executorScope.launch {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-        }
-
-        return createdAt
+        val jobs = paymentService.submitPaymentRequest(orderId, paymentId, amount, createdAt, deadline)
+        return Pair(createdAt, jobs)
     }
 }

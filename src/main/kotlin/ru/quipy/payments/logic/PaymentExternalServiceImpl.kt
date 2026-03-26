@@ -7,6 +7,9 @@ import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
 import kotlinx.coroutines.reactor.awaitSingleOrNull
@@ -20,6 +23,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.Executors
 
 
 // Advice: always treat time as a Duration
@@ -56,13 +60,23 @@ class PaymentExternalSystemAdapterImpl(
         .register(Metrics.globalRegistry)
 
     @OptIn(DelicateCoroutinesApi::class)
+    private val paymentScope = CoroutineScope(
+        newFixedThreadPoolContext(200, "payment_pool") + SupervisorJob()
+    )
+
+    @OptIn(DelicateCoroutinesApi::class)
     private val dbScope = CoroutineScope(
         newFixedThreadPoolContext(100, "db_pool")
     )
 
-    override suspend fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(orderId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Job {
         incomingRequestsCounter.increment()
+        return paymentScope.launch {
+            executePayment(paymentId, amount, paymentStartedAt, deadline)
+        }
+    }
 
+    private suspend fun executePayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val transactionId = UUID.randomUUID()
         val sample = Timer.start()
 

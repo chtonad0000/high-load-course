@@ -34,7 +34,7 @@ class APIController {
     data class User(val id: UUID, val name: String)
 
     @PostMapping("/orders")
-    suspend fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
+    fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
         val order = Order(
             UUID.randomUUID(),
             userId,
@@ -60,7 +60,7 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
         val now = System.currentTimeMillis()
         if (now + 500 > deadline) {
             return ResponseEntity
@@ -80,7 +80,7 @@ class APIController {
         val order = orderRepository.findById(orderId)
             ?: throw IllegalArgumentException("No such order $orderId")
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val (createdAt, jobs) = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
