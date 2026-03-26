@@ -44,7 +44,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper: ObjectMapper = ObjectMapper().registerKotlinModule()
-        private const val DEADLINE_BUFFER_MS = 140L
+        private const val DEADLINE_BUFFER_MS = 100L
     }
 
     private val serviceName = properties.serviceName
@@ -52,8 +52,8 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val retryAmount = 2
-    private val hedgeDelayMs = 160L
-    private val requestTimeoutMs = 1500L
+    private val hedgeDelayMs = 100L
+    private val requestTimeoutMs = 1400L
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
     private val semaphore = Semaphore(parallelRequests)
