@@ -51,9 +51,9 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val retryAmount = 2
-    private val hedgeDelayMs = 100L
-    private val requestTimeoutMs = 1400L
+    private val retryAmount = 3
+    private val hedgeDelayMs = 90L
+    private val requestTimeoutMs = 1300L
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
     private val semaphore = Semaphore(parallelRequests)
