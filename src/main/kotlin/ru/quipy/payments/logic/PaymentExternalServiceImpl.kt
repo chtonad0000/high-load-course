@@ -194,14 +194,16 @@ class PaymentExternalSystemAdapterImpl(
     fun preWarmConnection() {
         try {
             logger.info("[$accountName] Pre-warming connection to $paymentProviderHostPort")
-            for (i in 1..3) {
-                webClient
-                    .get()
-                    .uri("http://$paymentProviderHostPort/external/accounts?serviceName=$serviceName&token=$token")
-                    .retrieve()
-                    .toBodilessEntity()
-                    .block(Duration.ofSeconds(5))
-            }
+            reactor.core.publisher.Flux.range(1, 50)
+                .flatMap({
+                    webClient
+                        .get()
+                        .uri("http://$paymentProviderHostPort/external/accounts?serviceName=$serviceName&token=$token")
+                        .retrieve()
+                        .toBodilessEntity()
+                }, 50)
+                .collectList()
+                .block(Duration.ofSeconds(10))
             logger.info("[$accountName] Connection pre-warmed successfully")
         } catch (e: Exception) {
             logger.warn("[$accountName] Connection pre-warm failed: ${e.message}")
