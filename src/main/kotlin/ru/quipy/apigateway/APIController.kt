@@ -23,7 +23,7 @@ class APIController {
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private val paymentRateLimiter = LeakingBucketRateLimiter(1100, Duration.ofSeconds(1), 1100)
+    private val paymentRateLimiter = LeakingBucketRateLimiter(4500, Duration.ofSeconds(1), 4500)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -60,9 +60,16 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    suspend fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
+        val now = System.currentTimeMillis()
+        if (now + 800 > deadline) {
+            return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", "1")
+                .body(mapOf("error" to "Deadline too close"))
+        }
+
         if (!paymentRateLimiter.tick()) {
-            logger.warn("Rate limit exceeded for payment request, orderId: $orderId")
             return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", "1")
@@ -70,12 +77,10 @@ class APIController {
         }
 
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+        val order = orderRepository.findById(orderId)
+            ?: throw IllegalArgumentException("No such order $orderId")
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val (createdAt, jobs) = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 

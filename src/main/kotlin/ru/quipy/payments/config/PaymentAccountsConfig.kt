@@ -45,7 +45,9 @@ class PaymentAccountsConfig {
     fun webClient(): WebClient {
         val connectionProvider = ConnectionProvider
             .builder("connection_provider")
-            .maxConnections(10_000)
+            .maxConnections(4500)
+            .pendingAcquireTimeout(java.time.Duration.ofSeconds(10))
+            .maxIdleTime(java.time.Duration.ofSeconds(30))
             .build()
 
         val httpClient = HttpClient
@@ -85,7 +87,7 @@ class PaymentAccountsConfig {
                     paymentProviderHostPort,
                     token,
                     webClient
-                )
+                ).also { adapter -> adapter.preWarmConnection() }
             }
     }
 }
