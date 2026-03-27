@@ -10,9 +10,9 @@ import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
-import kotlinx.coroutines.reactor.awaitSingleOrNull
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
 import org.springframework.http.MediaType
@@ -21,9 +21,15 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -38,16 +44,25 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper: ObjectMapper = ObjectMapper().registerKotlinModule()
-        private const val DEADLINE_BUFFER_MS = 140L
+        private const val DEADLINE_BUFFER_MS = 100L
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val retryAmount = 3
+    private val hedgeDelayMs = 90L
+    private val requestTimeoutMs = 1300L
 
-    private val rateLimiter = SlidingWindowRateLimiter((rateLimitPerSec * 0.95).toLong())
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
     private val semaphore = Semaphore(parallelRequests)
+    private val scheduler = Executors.newScheduledThreadPool(100)
+
+    private val http2Client = HttpClient.newBuilder()
+        .executor(Executors.newFixedThreadPool(128))
+        .version(HttpClient.Version.HTTP_2)
+        .build()
 
     private val incomingRequestsCounter = Counter.builder("payment_requests_incoming")
         .tag("accountName", accountName)
@@ -61,7 +76,7 @@ class PaymentExternalSystemAdapterImpl(
 
     @OptIn(DelicateCoroutinesApi::class)
     private val paymentScope = CoroutineScope(
-        newFixedThreadPoolContext(270, "payment_pool") + SupervisorJob()
+        newFixedThreadPoolContext(250, "payment_pool") + SupervisorJob()
     )
 
     @OptIn(DelicateCoroutinesApi::class)
@@ -128,38 +143,44 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            val response = webClient
-                .post()
-                .uri(
-                    "http://$paymentProviderHostPort/external/process" +
-                            "?serviceName=$serviceName" +
-                            "&token=$token" +
-                            "&accountName=$accountName" +
-                            "&transactionId=$transactionId" +
-                            "&paymentId=$paymentId" +
-                            "&amount=$amount"
-                )
-                .accept(MediaType.APPLICATION_JSON)
-                .retrieve()
-                .toEntity(ExternalSysResponse::class.java)
-                .timeout(Duration.ofMillis(timeoutMillis))
-                .awaitSingleOrNull()
+            val idempotencyKey = transactionId.toString()
+            fun createRequest(): HttpRequest = HttpRequest.newBuilder()
+                .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
+                .header("x-idempotency-key", idempotencyKey)
+                .timeout(Duration.ofMillis(requestTimeoutMs))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build()
 
-            if (response != null) {
-                dbScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(
-                            response.body!!.result, now(), transactionId, reason = response.body!!.message
-                        )
-                    }
+            val futures = mutableListOf<CompletableFuture<HttpResponse<String>>>()
+            futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
+
+            for (i in 1..retryAmount) {
+                scheduler.schedule({
+                    if (futures.any { it.isDone }) return@schedule
+                    futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
+                }, hedgeDelayMs * i, TimeUnit.MILLISECONDS)
+            }
+
+            @Suppress("UNCHECKED_CAST")
+            val response = CompletableFuture.anyOf(*futures.toTypedArray()).await() as HttpResponse<String>
+
+            val body = try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
+            }
+
+            if (body.result) {
                 completedRequestsCounter.increment()
-            } else {
-                dbScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Empty response (timeout or error).")
-                    }
-                }
             }
         } catch (e: Exception) {
             when (e) {
