@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
@@ -9,13 +12,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newFixedThreadPoolContext
-import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withTimeout
 import org.slf4j.LoggerFactory
-import org.springframework.http.MediaType
 import org.springframework.web.reactive.function.client.WebClient
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -27,12 +28,10 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
-import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -51,13 +50,25 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val retryAmount = 3
-    private val hedgeDelayMs = 90L
     private val requestTimeoutMs = 1300L
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
-    private val semaphore = Semaphore(parallelRequests)
+    private val semaphore = kotlinx.coroutines.sync.Semaphore(parallelRequests)
     private val scheduler = Executors.newScheduledThreadPool(100)
+
+    private val circuitBreakerConfig = CircuitBreakerConfig.custom()
+        .failureRateThreshold(50F)
+        .slowCallRateThreshold(50F)
+        .slowCallDurationThreshold(Duration.ofMillis(requestTimeoutMs))
+        .waitDurationInOpenState(Duration.ofSeconds(5))
+        .permittedNumberOfCallsInHalfOpenState(10)
+        .minimumNumberOfCalls(20)
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+        .slidingWindowSize(100)
+        .build()
+
+    private val circuitBreaker: CircuitBreaker = CircuitBreakerRegistry.of(circuitBreakerConfig)
+        .circuitBreaker("payment-$accountName")
 
     private val http2Client = HttpClient.newBuilder()
         .executor(Executors.newFixedThreadPool(128))
@@ -72,6 +83,11 @@ class PaymentExternalSystemAdapterImpl(
     private val completedRequestsCounter = Counter.builder("payment_requests_completed")
         .tag("accountName", accountName)
         .description("Completed payment requests count")
+        .register(Metrics.globalRegistry)
+
+    private val circuitBreakerRejectedCounter = Counter.builder("payment_circuit_breaker_rejected")
+        .tag("accountName", accountName)
+        .description("Requests rejected by circuit breaker")
         .register(Metrics.globalRegistry)
 
     @OptIn(DelicateCoroutinesApi::class)
@@ -113,7 +129,20 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        if (!circuitBreaker.tryAcquirePermission()) {
+            circuitBreakerRejectedCounter.increment()
+            logger.warn("[$accountName] Circuit breaker OPEN, rejecting payment $paymentId")
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Circuit breaker is OPEN.")
+                }
+            }
+            return
+        }
+        val cbStartTime = now()
+
         if (!semaphore.tryAcquire()) {
+            circuitBreaker.onError(now() - cbStartTime, TimeUnit.MILLISECONDS, RuntimeException("Too many parallel requests"))
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Too many parallel requests.")
@@ -125,6 +154,7 @@ class PaymentExternalSystemAdapterImpl(
         try {
             val rateLimitTimeout = deadline - now() - DEADLINE_BUFFER_MS
             if (rateLimitTimeout <= 0 || !rateLimiter.tickSuspend(rateLimitTimeout)) {
+                circuitBreaker.onError(now() - cbStartTime, TimeUnit.MILLISECONDS, RuntimeException("Rate limiter timeout"))
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Rate limiter timeout.")
@@ -135,6 +165,7 @@ class PaymentExternalSystemAdapterImpl(
 
             val timeoutMillis = deadline - now() - DEADLINE_BUFFER_MS
             if (timeoutMillis <= 0) {
+                circuitBreaker.onError(now() - cbStartTime, TimeUnit.MILLISECONDS, RuntimeException("No time left"))
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "No time left after rate limiting.")
@@ -151,18 +182,21 @@ class PaymentExternalSystemAdapterImpl(
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build()
 
-            val futures = mutableListOf<CompletableFuture<HttpResponse<String>>>()
-            futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
-
-            for (i in 1..retryAmount) {
-                scheduler.schedule({
-                    if (futures.any { it.isDone }) return@schedule
-                    futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
-                }, hedgeDelayMs * i, TimeUnit.MILLISECONDS)
+            val response = try {
+                withTimeout(timeoutMillis) {
+                    val future = http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString())
+                    future.await()
+                }
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                logger.warn("[$accountName] Payment timed out (deadline) for txId: $transactionId, payment: $paymentId")
+                circuitBreaker.onError(now() - cbStartTime, TimeUnit.MILLISECONDS, e)
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline timeout.")
+                    }
+                }
+                return
             }
-
-            @Suppress("UNCHECKED_CAST")
-            val response = CompletableFuture.anyOf(*futures.toTypedArray()).await() as HttpResponse<String>
 
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
@@ -173,19 +207,25 @@ class PaymentExternalSystemAdapterImpl(
 
             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
+            val duration = now() - cbStartTime
+            if (body.result) {
+                circuitBreaker.onSuccess(duration, TimeUnit.MILLISECONDS)
+                completedRequestsCounter.increment()
+            } else {
+                circuitBreaker.onError(duration, TimeUnit.MILLISECONDS, RuntimeException(body.message ?: "Payment failed"))
+            }
+
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
             }
-
-            if (body.result) {
-                completedRequestsCounter.increment()
-            }
         } catch (e: Exception) {
+            val duration = now() - cbStartTime
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                    circuitBreaker.onError(duration, TimeUnit.MILLISECONDS, e)
                     dbScope.launch {
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
@@ -194,7 +234,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
+                    circuitBreaker.onError(duration, TimeUnit.MILLISECONDS, e)
                     dbScope.launch {
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = e.message)
