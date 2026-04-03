@@ -2,20 +2,15 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.DelicateCoroutinesApi
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.*
 import kotlinx.coroutines.future.await
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.newFixedThreadPoolContext
 import kotlinx.coroutines.sync.Semaphore
 import org.slf4j.LoggerFactory
-import org.springframework.http.MediaType
 import org.springframework.web.reactive.function.client.WebClient
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -25,9 +20,9 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.net.http.HttpTimeoutException
 import java.time.Duration
-import java.util.UUID
-import java.util.concurrent.CompletableFuture
+import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -51,13 +46,16 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val retryAmount = 3
-    private val hedgeDelayMs = 90L
+    private val retryAmount = 0
     private val requestTimeoutMs = 1300L
+    private val maxDeferredRetries = 5000
 
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong())
     private val semaphore = Semaphore(parallelRequests)
     private val scheduler = Executors.newScheduledThreadPool(100)
+
+    private val deferDelayMs = 90L
+    private val deferredRetryLimiter = Semaphore(maxDeferredRetries)
 
     private val http2Client = HttpClient.newBuilder()
         .executor(Executors.newFixedThreadPool(128))
@@ -73,6 +71,21 @@ class PaymentExternalSystemAdapterImpl(
         .tag("accountName", accountName)
         .description("Completed payment requests count")
         .register(Metrics.globalRegistry)
+
+    private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
+        "payment-$accountName",
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(20)
+            .minimumNumberOfCalls(10)
+            .failureRateThreshold(50f)
+            .slowCallRateThreshold(50f)
+            .slowCallDurationThreshold(Duration.ofMillis(1500))
+            .waitDurationInOpenState(Duration.ofSeconds(5))
+            .permittedNumberOfCallsInHalfOpenState(10)
+            .recordExceptions(SocketTimeoutException::class.java, Exception::class.java)
+            .build()
+    )
 
     @OptIn(DelicateCoroutinesApi::class)
     private val paymentScope = CoroutineScope(
@@ -122,9 +135,13 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        val start = System.currentTimeMillis()
         try {
-            val rateLimitTimeout = deadline - now() - DEADLINE_BUFFER_MS
-            if (rateLimitTimeout <= 0 || !rateLimiter.tickSuspend(rateLimitTimeout)) {
+            if (!rateLimiter.tick()) {
+                if (tryScheduleRetry(orderId, paymentId, amount, paymentStartedAt, deadline)) {
+                    return
+                }
+
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Rate limiter timeout.")
@@ -143,32 +160,36 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
+            if (!circuitBreaker.tryAcquirePermission()) {
+                if (tryScheduleRetry(orderId, paymentId, amount, paymentStartedAt, deadline)) {
+                    return
+                }
+
+                dbScope.launch {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Circuit open")
+                    }
+                }
+                return
+            }
             val idempotencyKey = transactionId.toString()
             fun createRequest(): HttpRequest = HttpRequest.newBuilder()
                 .uri(URI("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"))
                 .header("x-idempotency-key", idempotencyKey)
-                .timeout(Duration.ofMillis(requestTimeoutMs))
+                .timeout(Duration.ofMillis(minOf(requestTimeoutMs, timeoutMillis)))
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build()
 
-            val futures = mutableListOf<CompletableFuture<HttpResponse<String>>>()
-            futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
-
-            for (i in 1..retryAmount) {
-                scheduler.schedule({
-                    if (futures.any { it.isDone }) return@schedule
-                    futures.add(http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString()))
-                }, hedgeDelayMs * i, TimeUnit.MILLISECONDS)
-            }
-
             @Suppress("UNCHECKED_CAST")
-            val response = CompletableFuture.anyOf(*futures.toTypedArray()).await() as HttpResponse<String>
+            val response = http2Client.sendAsync(createRequest(), HttpResponse.BodyHandlers.ofString())
+                .await() as HttpResponse<String>
 
             val body = try {
                 mapper.readValue(response.body(), ExternalSysResponse::class.java)
             } catch (e: Exception) {
                 logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: ${response.body()}")
                 ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                throw e
             }
 
             logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -179,12 +200,18 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
+            circuitBreaker.onSuccess(System.currentTimeMillis() - start, TimeUnit.MILLISECONDS)
             if (body.result) {
                 completedRequestsCounter.increment()
             }
         } catch (e: Exception) {
+            circuitBreaker.onError(System.currentTimeMillis() - start, TimeUnit.MILLISECONDS, e)
             when (e) {
-                is SocketTimeoutException -> {
+                is SocketTimeoutException, is HttpTimeoutException -> {
+                    if (tryScheduleRetry(orderId, paymentId, amount, paymentStartedAt, deadline)) {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                        return
+                    }
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                     dbScope.launch {
                         paymentESService.update(paymentId) {
@@ -210,6 +237,30 @@ class PaymentExternalSystemAdapterImpl(
                 "account", accountName
             ))
         }
+    }
+
+    private fun tryScheduleRetry(
+        orderId: UUID,
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long
+    ): Boolean {
+        if (!deferredRetryLimiter.tryAcquire()) {
+            return false
+        }
+
+        scheduler.schedule({
+            try {
+                paymentScope.launch {
+                    executePayment(orderId, paymentId, amount, paymentStartedAt, deadline)
+                }
+            } finally {
+                deferredRetryLimiter.release()
+            }
+        }, deferDelayMs, TimeUnit.MILLISECONDS)
+
+        return true
     }
 
     fun preWarmConnection() {
